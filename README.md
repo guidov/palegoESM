@@ -690,6 +690,7 @@ JAX_ENABLE_X64=1 pytest tests/
 |---|---|---|---|---|---|
 | Finite-volume dycores + ocean (single-process) | CPU (`jax` CPU backend) | N/A | `>=0.8,<0.10` | N/A | Regular unit/regression path |
 | Finite-volume dycores + ocean (single-process) | Apple Silicon Metal (`jax-mps` / MLX, `JAX_PLATFORMS=mps`) | N/A | `>=0.8,<0.10` | N/A | FV solvers only (`float32`); no `float64` |
+| Finite-volume, spectral, ocean & full ESM | Intel GPU / Arc / XPU (`jax-oneapi-plugin` / OpenXLA) | N/A | `==0.11.2` | N/A | Supported via `oneapi` extra; full `float32` and `float64` (`JAX_ENABLE_X64=1`) |
 | Spectral solvers (atmosphere/ocean) | CPU (`JAX_PLATFORMS=cpu`) | N/A | `>=0.8,<0.10` | N/A | Requires `float64`/`complex128`; not mps-compatible |
 | Distributed MPI halo/reductions | CPU + OpenMPI (`mpirun`) | OpenMPI 4.x/5.x | `>=0.8,<0.10` / `>=0.10,<0.11` | `>=0.8,<0.9` / `>=0.9,<0.10` | Two generations, paired: legacy (jax 0.8–0.9 + mpi4jax 0.8) or FFI (jax 0.10 + mpi4jax 0.9); validated with `mpirun -np 2/3/6` |
 | Multi-device scaling suite | CPU/GPU (if available) | Optional | `>=0.8,<0.10` | `>=0.8,<0.9` (MPI mode) | `scripts/bench/run_levante_gpu_scaling.py` |
@@ -763,6 +764,30 @@ To check your current JAX backend:
 ```bash
 python -c "import jax; print(jax.default_backend())"
 ```
+
+### Intel GPU / XPU (oneAPI / OpenXLA backend)
+
+legoESM runs on Intel discrete and data center GPUs (e.g. Intel Arc B580 / Battlemage, Arc A-series, Data Center GPU Max) via Intel's OpenXLA PJRT plugin. Unlike Apple MPS, Intel GPUs support standard IEEE `float64` (`JAX_ENABLE_X64=1`), enabling both finite-volume and spectral solvers as well as high-precision ocean simulations.
+
+1. **Prerequisites**:
+   Ensure Intel graphics compute runtime / Level-Zero (`intel-opencl-icd`, `level-zero`) and Intel oneAPI Base Toolkit (2025.1+) are installed. Source the environment before executing:
+   ```bash
+   source /opt/intel/oneapi/2025.1/oneapi-vars.sh
+   ```
+
+2. **Installation**:
+   Install `legoesm` with the `[oneapi]` extra:
+   ```bash
+   pip install -e ".[oneapi]"
+   # Or directly:
+   pip install "jax==0.11.2" "jaxlib==0.11.2" "jax-oneapi-plugin==0.11.2" "jax-oneapi-pjrt==0.11.2"
+   ```
+
+3. **Verify Device**:
+   ```bash
+   python -c "import jax; print(jax.devices())"
+   # Output: [OneapiDevice(id=0)]
+   ```
 
 ## Versioning
 

@@ -91,6 +91,12 @@ data = [
 # mpi4jax-collective run must stay on ``JAX_PLATFORMS=cpu``. Single MpsDevice:
 # no SPMD/MPI multi-device. Good for single-device float32 FV dycore / ML work.
 mps = ["jax-mps"]
+# Intel GPU / XPU backend via OpenXLA PJRT plugin (oneAPI).
+# Fully supports float64 (JAX_ENABLE_X64=1) and float32.
+oneapi = [
+    "jax-oneapi-plugin==0.11.2",
+    "jax-oneapi-pjrt==0.11.2",
+]
 # Interactive configuration wizard (scripts/experiment/wizard.py, `legoesm wizard`).
 wizard = ["questionary>=2.0"]
 # Tested jax envelope for MPI is >=0.8,<0.10 (runtime-guarded in
