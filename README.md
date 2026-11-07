@@ -38,6 +38,7 @@ Paleoclimate simulations (such as modeling the Last Glacial Maximum (LGM) or Dee
 ### Paleoclimate Repositories & Datasets
 
 - **Code Repository (`palegoESM`)**: [`https://github.com/guidov/palegoESM`](https://github.com/guidov/palegoESM) (upstream `legoESM` tracked via `origin`, paleoclimate boundary-condition toolkit in [`scripts/paleo/`](file:///home/guido/palegoESM/scripts/paleo/README.md)).
+- **Classic CESM1 Boundary Condition Toolkit (`cesm1-paleo-bc`)**: [`https://github.com/guidov/cesm1-paleo-bc`](https://github.com/guidov/cesm1-paleo-bc) (cleaned, Python-3-modernized CESM1 4-step paleo boundary condition code).
 - **Public Dataset Repository (Hugging Face)**: [`https://huggingface.co/datasets/guidov/palegoESM-data`](https://huggingface.co/datasets/guidov/palegoESM-data) — hosts compressed NetCDF-4 `palegoESM`-ready 0.25° topography/bathymetry/ice-mask datasets (`ICE-6G_C`, `ICE-6G_A`, `ICE-7G_NA`, `ICE-5G`, `ETOPO` 0 ka), LGM CLM `surfdata`, and the 10-arc-minute source reconstructions. Also mirrored on [GitHub Release `v0.1.0-data`](https://github.com/guidov/palegoESM/releases/tag/v0.1.0-data).
 - **Fetch Datasets**:
   ```bash

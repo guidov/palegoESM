@@ -2,8 +2,8 @@
 
 This directory contains tools for building and configuring paleoclimate (e.g. LGM 21 ka, Mid-Holocene 6 ka, MIS3 38 ka, and Pre-Industrial 0 ka control) boundary conditions in `palegoESM`, adapted from Guido Vettoretti's CESM1 paleoclimate boundary-condition workflow.
 
-- **Reference CESM1 archive**: [`/home/guido/cesm1_paleo_bc/README.md`](file:///home/guido/cesm1_paleo_bc/README.md)
-- **External dataset catalog**: [`/home/guido/paleo_data/README.md`](file:///home/guido/paleo_data/README.md)
+- **Reference CESM1 archive**: [`https://github.com/guidov/cesm1-paleo-bc`](https://github.com/guidov/cesm1-paleo-bc) (local clone in [`/home/guido/cesm1_paleo_bc/README.md`](file:///home/guido/cesm1_paleo_bc/README.md))
+- **External dataset catalog**: [`https://huggingface.co/datasets/guidov/palegoESM-data`](https://huggingface.co/datasets/guidov/palegoESM-data) (local catalog in [`/home/guido/paleo_data/README.md`](file:///home/guido/paleo_data/README.md))
 
 ---
 
