@@ -444,13 +444,25 @@ def _step_land_canopy(
     original_shape = T_soil.shape
     is_flat = (T_soil.ndim == 1)
 
-    # --- Spatial parameters (for slab post-flux pipeline) ---
+    # --- Flatten state for the canopy vmap ---
     def _flat(x):
-        return x if (is_flat or not hasattr(x, "ndim") or x.ndim == 0) else x.reshape(-1)
+        return x if is_flat else x.reshape(-1)
 
-    W_max  = _flat(_get(lp, "W_max", config.W_max))
-    C_soil = _flat(_get(lp, "C_soil", config.C_soil))
-    d_soil = _flat(_get(lp, "d_soil", config.d_soil))
+    # Every spatial land param (the coupler hands slab land ``reshape_params``
+    # output: each leaf on the state's grid shape) is flattened like the state,
+    # for the post-flux pipeline AND the canopy solve.  Leaves whose leading
+    # dims are not the grid (scalars, per-PFT tables) pass through unchanged.
+    if lp is not None and not is_flat:
+        _nd = len(original_shape)
+        lp = jax.tree.map(
+            lambda x: (x.reshape((-1,) + x.shape[_nd:])
+                       if getattr(x, "shape", ())[:_nd] == original_shape else x),
+            lp)
+
+    # --- Spatial parameters (for slab post-flux pipeline) ---
+    W_max  = _get(lp, "W_max", config.W_max)
+    C_soil = _get(lp, "C_soil", config.C_soil)
+    d_soil = _get(lp, "d_soil", config.d_soil)
 
     T_soil_flat   = _flat(T_soil)
     W_flat        = _flat(W)
@@ -502,21 +514,13 @@ def _step_land_canopy(
     _lai_full = compute_prognostic_lai(carbon_state, config, config.surface_scheme)
     LAI_override = _flat(_lai_full) if _lai_full is not None else None
 
-    # Flatten all canopy_params array fields if they are 2D (e.g. latlon (24, 48))
-    lp_flat = lp
-    if lp is not None and not is_flat:
-        lp_flat = jax.tree.map(
-            lambda x: _flat(x) if hasattr(x, "shape") and x.ndim >= 1 else x,
-            lp,
-        )
-
     # --- Canopy surface flux closure ---
     surface_out = compute_two_leaf_canopy_fluxes(
         T_soil_top=T_soil_flat,
         forcing=forcing_flat,
         canopy_config=config.surface_scheme,
         land_config=config,
-        canopy_params=lp_flat,
+        canopy_params=lp,
         w_frac_rz=w_frac_rz,
         wind_speed=wind_speed,
         wind_dir_x=wind_dir_x,
@@ -588,6 +592,8 @@ def _step_land_canopy(
 
     # Excess (unrealised) latent flux warms the slab.
     T_soil_new = T_soil_new + dt * evap_excess_energy / heat_cap_total
+    # End-of-step bucket fraction, on the flat axis W_max lives on (carbon below).
+    w_frac_new = jnp.clip(W_new / W_max, 0.0, 1.0)
 
     # --- Reshape back to original (cubed-sphere or columnar) shape ---
     def _unflat(x):
@@ -646,8 +652,7 @@ def _step_land_canopy(
             gpp_override = None
         # Slab carbon path: pass start-of-step bucket beta as the
         # moisture forcing (consistent with the existing SimpleSEB path).
-        beta_soil_new = config.beta_min + (1.0 - config.beta_min) * jnp.clip(
-            W_new / W_max, 0.0, 1.0)
+        beta_soil_new = config.beta_min + (1.0 - config.beta_min) * _unflat(w_frac_new)
         carbon_state_new, co2_flux = step_carbon(
             carbon_state, forcing.sw_down, T_soil_new, forcing.co2_ppmv,
             beta_soil_new, lat_arr, doy, forcing.precip_total,

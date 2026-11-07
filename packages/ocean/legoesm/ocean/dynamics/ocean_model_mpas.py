@@ -324,6 +324,14 @@ class MPASOceanModel(IntegrationMixin):
                     "(build it with nemo_runoff_depth_map, which floors at 1 m) "
                     "— zero/negative cells would silently drop the runoff "
                     "dilution.")
+        _rdsl = getattr(self.config, "runoff_depth_spread_levels", None)
+        if _rdsl is not None:
+            import numpy as _np
+            _rdsl_np = _np.asarray(_rdsl)
+            if (not _np.issubdtype(_rdsl_np.dtype, _np.integer)) or (_rdsl_np < 1).any():
+                raise ValueError(
+                    "runoff_depth_spread_levels must be an integer map >= 1 "
+                    "(build it with nemo_runoff_level_count).")
         # Reserved distributed-PCG knobs (single-rank stock CG today; see
         # barotropic_implicit_mpas.py Step-4 TODO).  Validate so the
         # schema stays consistent with the lat-lon path.
@@ -626,15 +634,6 @@ class MPASOceanModel(IntegrationMixin):
         T_new = state.T.data + dt * tend.dT_dt.data
         S_new = state.S.data + dt * tend.dS_dt.data
 
-        # Fill land cells with ocean-neighbor average (Neumann BC) so that
-        # subsequent operators see smooth values at coastlines instead of
-        # the sharp ocean-to-zero discontinuity that `* mask` would create.
-        c1_m = mesh.cellsOnEdge[0]
-        c2_m = mesh.cellsOnEdge[1]
-        T_new = fill_land_cells_mpas(T_new, mask, c1_m, c2_m,
-                                     mesh.edgesOnCell, mesh.nEdgesOnCell)
-        S_new = fill_land_cells_mpas(S_new, mask, c1_m, c2_m,
-                                     mesh.edgesOnCell, mesh.nEdgesOnCell)
         # 2a (coefficients). Vertical-mixing coefficients for the implicit
         # tracer solve (after the halo exchange below) and the momentum
         # solve (3a).  When KPP and/or convective adjustment are enabled,
@@ -858,6 +857,20 @@ class MPASOceanModel(IntegrationMixin):
         if halo_refresh is not None:
             (u_star,), (T_new, S_new) = halo_refresh.both(
                 (u_star,), (T_new, S_new))
+
+        # Fill land cells with ocean-neighbor average (Neumann BC) so that
+        # subsequent operators see smooth values at coastlines instead of
+        # the sharp ocean-to-zero discontinuity that `* mask` would create.
+        # After the R1 refresh: a land cell near a rank boundary then fills
+        # from the owners' ocean values, not this rank's stale outer halo.
+        c1_m = mesh.cellsOnEdge[0]
+        c2_m = mesh.cellsOnEdge[1]
+        T_new = fill_land_cells_mpas(T_new, mask, c1_m, c2_m,
+                                     mesh.edgesOnCell, mesh.nEdgesOnCell,
+                                     band_capacity=config.land_fill_band_capacity)
+        S_new = fill_land_cells_mpas(S_new, mask, c1_m, c2_m,
+                                     mesh.edgesOnCell, mesh.nEdgesOnCell,
+                                     band_capacity=config.land_fill_band_capacity)
 
         # 2a (solve). Implicit vertical tracer diffusion (backward-Euler),
         # BEFORE GM/Redi and advection, on per-cell layer thickness (partial
@@ -1226,7 +1239,8 @@ class MPASOceanModel(IntegrationMixin):
             )
             _F_entry, _entry_heat = real_freshwater_entry(
                 freshwater, F_slow_eta, h_k_new, mask, config.rho_0,
-                T_corrected, runoff_spread_m=resolve_runoff_spread_arg(config))
+                T_corrected, runoff_spread_m=resolve_runoff_spread_arg(config),
+                runoff_t_floor_sharpness=config.runoff_temperature_floor_sharpness)
             _dS_dil, _dT_dil = real_freshwater_dilution_tendencies(
                 F_slow_eta, S_corrected, T_corrected, h_k_new, mask,
                 F_entry=_F_entry, entry_heat=_entry_heat)

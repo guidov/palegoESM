@@ -110,10 +110,11 @@ EXCLUDED: frozenset[str] = frozenset(
         "packages/atmosphere/legoesm/atmosphere/physics/microphysics/output.py",
         # Shared microphysics primitive libraries (NOT single-tendency schemes):
         # _warm_rain = saturation-adjustment / autoconversion / accretion / rain-
-        # evap helpers reused by Kessler/SB/Morrison/Thompson/P3; _thompson_snow =
-        # Thompson-2008 snow process functions used by thompson.py. Like _shared.py.
+        # evap helpers reused by Kessler/SB/Morrison/P3. Like _shared.py.
         "packages/atmosphere/legoesm/atmosphere/physics/microphysics/_warm_rain.py",
-        "packages/atmosphere/legoesm/atmosphere/physics/microphysics/_thompson_snow.py",
+        # WRF v4.8.0 Thompson init half (module PARAMETERs, gamma constants and
+        # lookup tables); the scheme (thompson_wrf.py) carries the contract.
+        "packages/atmosphere/legoesm/atmosphere/physics/microphysics/thompson_wrf_tables.py",
         "packages/atmosphere/legoesm/atmosphere/physics/microphysics/sdm/__init__.py",
         "packages/atmosphere/legoesm/atmosphere/physics/microphysics/sdm/config.py",
         "packages/atmosphere/legoesm/atmosphere/physics/microphysics/sdm/particles.py",
@@ -123,17 +124,27 @@ EXCLUDED: frozenset[str] = frozenset(
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/config.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/integration.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/output.py",
+        # ecRad 49r1 port: package docstring and the vendored RRTMG table loader (plumbing).
+        "packages/atmosphere/legoesm/atmosphere/physics/radiation/ecrad_ifs/__init__.py",
+        "packages/atmosphere/legoesm/atmosphere/physics/radiation/ecrad_ifs/_libm.py",  # exp helper (V45)
+        # ecRad lane run settings + pending-source container (vote L21a): config plumbing.
+        "packages/atmosphere/legoesm/atmosphere/physics/radiation/ecrad_ifs/config.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/__init__.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/config/__init__.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/config/radiative_transfer.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/constants.py",
-        "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/interpolation.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/kernel_ops.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/__init__.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/atmospheric_state.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/cloud_optics.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/constants.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/data_loader_base.py",
+        # CAM6 Mitchell ice/snow optics table loader + band optics (engine, like cloud_optics.py).
+        "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/mitchell_ice_optics.py",
+        # CAM6 gammadist liquid optics table + band optics, and the shared CAM
+        # lininterp they and the Mitchell optics use (engine, like cloud_optics.py).
+        "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/cam6_liquid_optics.py",
+        "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/cam_lininterp.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/gas_optics.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/lookup_cloud_optics.py",
         "packages/atmosphere/legoesm/atmosphere/physics/radiation/rrtmgp/optics/lookup_gas_optics_base.py",

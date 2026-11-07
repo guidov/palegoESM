@@ -1591,7 +1591,7 @@ def _sponge_rate_from_config(coord, sponge_sigma: float,
 
 def _build_hydro_tile_tendency_fns(coord, cdgrid, nl: int, nlev: int,
                                    p_floor: float, scalar_body, vector_body,
-                                   sponge_rate=None):
+                                   sponge_rate=None, halo_grouping="current"):
     """Build the SHARED per-tile hydrostatic tendency + metric-slicer closures
     used by BOTH ``make_tiled_fv3_hydrostatic_tendencies_stage_2d`` (called once)
     and ``make_tiled_fv3_hydrostatic_step_stage_2d`` (called once per SSP-RK3
@@ -1624,7 +1624,8 @@ def _build_hydro_tile_tendency_fns(coord, cdgrid, nl: int, nlev: int,
     def _tile_tendency(u_d_t, v_d_t, T_t, p_s_t, phis_t,
                        cosa_c_t, dxe_t, dye_t, ar_t, gc, fco_t, cosau_t,
                        dx_t, dy_t, ca_t, sa_t, cap_t, sap_t, offs,
-                       q_pack_t=None, column_physics_fn=None):
+                       q_pack_t=None, column_physics_fn=None,
+                       surface_fn=None, T_sfc_t=None):
         # ---- cc winds: dgrid_to_center_vector for B/thermo (within-face, NO
         #      halo); interp_corner_to_center (batched) for vertical advection.
         u_cell, v_cell = dgrid_to_center_vector(u_d_t, v_d_t)  # (1, nl, nl, nlev)
@@ -1644,7 +1645,36 @@ def _build_hydro_tile_tendency_fns(coord, cdgrid, nl: int, nlev: int,
             dp_t = dp_from_hybrid(coord, p_s_t)     # (1, nl, nl, nlev)
         else:
             dp_t = p_s_t[..., None] * coord.dsigma.astype(p_s_t.dtype)
-        dp_pad = scalar_body(dp_t[0], offs)[None]   # (1, nl+2, nl+2, nlev)
+        def _independent_scalars():
+            # ---- p_adiab + ln_ps (cc-local) ----
+            if _hybrid:
+                p_full = pressure_from_hybrid(coord, p_s_t)         # (1, nl, nl, nlev)
+            else:
+                p_full = pressure_from_sigma(coord.sigma_full, p_s_t)
+            p_adiab = jnp.maximum(p_full, _p_floor)
+            ln_ps = jnp.log(p_s_t)
+            _pg_dt = jnp.result_type(
+                ln_ps.dtype, resolve_dtype("atm_pressure_gradient", "compute"))
+            ln_ps_3d = ln_ps.astype(_pg_dt)[..., None]              # (1, nl, nl, 1)
+
+            # ---- MOMENTUM (eq 307-479): B=KE+Phi ; zeta ; scalar halos ----
+            Phi = _geo(T_t, p_s_t, coord, phis_t)
+            B = 0.5 * (u_cell ** 2 + v_cell ** 2) + Phi            # (1, nl, nl, nlev)
+            zeta = dgrid_vorticity_core(
+                u_d_t, v_d_t, cosa_c_t, dxe_t, dye_t, ar_t)
+            inv_T = 1.0 / T_t
+
+            return p_adiab, _pg_dt, ln_ps_3d, B, zeta, inv_T
+
+        if halo_grouping == "bundled":
+            p_adiab, _pg_dt, ln_ps_3d, B, zeta, inv_T = _independent_scalars()
+            from legoesm.parallel.cubesphere_exchange import bundled_tiled_pad
+            dp_pad, B_pad, zeta_pad, invT_pad, lnps_pad, T_pad = (
+                x[None] for x in bundled_tiled_pad(
+                    scalar_body,
+                    (dp_t[0], B[0], zeta[0], inv_T[0], ln_ps_3d[0], T_t[0]), offs))
+        else:
+            dp_pad = scalar_body(dp_t[0], offs)[None]
         dp_u, dp_v = cgrid_interp_cc_to_faces_local(dp_pad)
         div_dp = cgrid_divergence_local(
             dp_u * u_c, dp_v * v_c, dye_t, dxe_t, ar_t)  # (1, nl, nl, nlev)
@@ -1675,31 +1705,15 @@ def _build_hydro_tile_tendency_fns(coord, cdgrid, nl: int, nlev: int,
         vert_adv_u_cc, vert_adv_v_cc, vert_adv_T = (
             _vadv_uvT[0], _vadv_uvT[1], _vadv_uvT[2])
 
-        # ---- p_adiab + ln_ps (cc-local) ----
-        if _hybrid:
-            p_full = pressure_from_hybrid(coord, p_s_t)         # (1, nl, nl, nlev)
-        else:
-            p_full = pressure_from_sigma(coord.sigma_full, p_s_t)
-        p_adiab = jnp.maximum(p_full, _p_floor)
-        ln_ps = jnp.log(p_s_t)
-        _pg_dt = jnp.result_type(
-            ln_ps.dtype, resolve_dtype("atm_pressure_gradient", "compute"))
-        ln_ps_3d = ln_ps.astype(_pg_dt)[..., None]              # (1, nl, nl, 1)
-
-        # ---- MOMENTUM (eq 307-479): B=KE+Phi ; zeta ; scalar halos ----
-        Phi = _geo(T_t, p_s_t, coord, phis_t)
-        B = 0.5 * (u_cell ** 2 + v_cell ** 2) + Phi            # (1, nl, nl, nlev)
-        zeta = dgrid_vorticity_core(
-            u_d_t, v_d_t, cosa_c_t, dxe_t, dye_t, ar_t)
-        inv_T = 1.0 / T_t
-
-        # In-stage SCALAR halos.  ln_ps SHARED by momentum PGF + thermo (x64: the
-        # _pg_dt cast is a no-op, so this padded ln_ps == both standalone halos).
-        B_pad = scalar_body(B[0], offs)[None]
-        zeta_pad = scalar_body(zeta[0], offs)[None]
-        invT_pad = scalar_body(inv_T[0], offs)[None]
-        lnps_pad = scalar_body(ln_ps_3d[0], offs)[None]        # (1, nl+2, nl+2, 1)
-        T_pad = scalar_body(T_t[0], offs)[None]                # (1, nl+2, nl+2, nlev)
+        if halo_grouping == "current":
+            p_adiab, _pg_dt, ln_ps_3d, B, zeta, inv_T = _independent_scalars()
+            # In-stage SCALAR halos.  ln_ps SHARED by momentum PGF + thermo (x64: the
+            # _pg_dt cast is a no-op, so this padded ln_ps == both standalone halos).
+            B_pad = scalar_body(B[0], offs)[None]
+            zeta_pad = scalar_body(zeta[0], offs)[None]
+            invT_pad = scalar_body(inv_T[0], offs)[None]
+            lnps_pad = scalar_body(ln_ps_3d[0], offs)[None]        # (1, nl+2, nl+2, 1)
+            T_pad = scalar_body(T_t[0], offs)[None]                # (1, nl+2, nl+2, nlev)
 
         zeta_corner = (interp_center_to_corner(zeta_pad, cdgrid, padded=zeta_pad)
                        + fco_t[..., None])
@@ -1760,6 +1774,15 @@ def _build_hydro_tile_tendency_fns(coord, cdgrid, nl: int, nlev: int,
         adiabatic = adiabatic + kappa * T_t * v_dot_grad_lnps
         dT_dt = horiz_adv_T + vert_adv_T + adiabatic
 
+        # Injected surface exchange: lowest-level cc winds from the SAME
+        # corner->centre transform the cell-centre exit state uses.
+        dq_v_sfc = None
+        if surface_fn is not None:
+            dT_sfc, dq_v_sfc = surface_fn(
+                T_t, p_s_t, None if q_pack_t is None else q_pack_t[..., 0],
+                u_cc_va[..., -1], v_cc_va[..., -1], T_sfc_t)
+            dT_dt = dT_dt + dT_sfc
+
         if q_pack_t is None:
             return du_d_dt, dv_d_dt, dT_dt, dp_s_dt
 
@@ -1781,6 +1804,8 @@ def _build_hydro_tile_tendency_fns(coord, cdgrid, nl: int, nlev: int,
         vert_adv_q = jnp.moveaxis(vadv_q_lead, 0, -1)     # (1, nl, nl, nlev, nt)
         dT_k, dq_v, dq_c, dq_r = column_physics_fn(
             T_t, p_s_t, q_pack_t[..., 0], q_pack_t[..., 1], q_pack_t[..., 2])
+        if dq_v_sfc is not None:
+            dq_v = dq_v + dq_v_sfc
         phys_pack = jnp.stack([dq_v, dq_c, dq_r], axis=-1)  # (1, nl, nl, nlev, 3)
         dq_pack = dq_horiz + vert_adv_q + phys_pack
         return du_d_dt, dv_d_dt, dT_dt + dT_k, dp_s_dt, dq_pack
@@ -2018,7 +2043,8 @@ def make_tiled_fv3_hydrostatic_step_stage_2d(mesh, cdgrid, coord, n: int,
                                             kt: int, nlev: int, *,
                                             p_floor: float, dt: float,
                                             sponge_sigma: float = 0.0,
-                                            sponge_tau_sec: float = 0.0):
+                                            sponge_tau_sec: float = 0.0,
+                                            halo_grouping="bundled"):
     """Full tiled SSP-RK3 STEP on a ``(6, kt, kt)`` mesh.
 
     Returns ``step(u_d, v_d, T, p_s, phis) -> (u_d, v_d, T, p_s)`` advanced one
@@ -2036,6 +2062,8 @@ def make_tiled_fv3_hydrostatic_step_stage_2d(mesh, cdgrid, coord, n: int,
     _validate_tiled_step_factory_args(
         "make_tiled_fv3_hydrostatic_step_stage_2d", mesh, cdgrid, coord, n,
         kt, nlev, p_floor, dt)
+    if halo_grouping not in ("current", "bundled"):
+        raise ValueError(f"unknown halo_grouping {halo_grouping!r}")
     grid = cdgrid.base
     nl = n // kt
     _dt = float(dt)
@@ -2055,13 +2083,15 @@ def make_tiled_fv3_hydrostatic_step_stage_2d(mesh, cdgrid, coord, n: int,
 
     scalar_body = make_tiled_pad_body(mesh, ndim=4, halo=1, with_offsets=True)
     vector_body = make_tiled_pad_vector_body(
-        mesh, ndim=4, halo=1, with_offsets=True)
+        mesh, ndim=4, halo=1, with_offsets=True,
+        halo_grouping=halo_grouping)
 
     # Shared tendency numerics (same builder as the tendency stage — no dup).
     _tile_tendency, _slice_metrics = _build_hydro_tile_tendency_fns(
         coord, cdgrid, nl, nlev, p_floor, scalar_body, vector_body,
         sponge_rate=_sponge_rate_from_config(coord, sponge_sigma,
-                                             sponge_tau_sec))
+                                             sponge_tau_sec),
+        halo_grouping=halo_grouping)
 
     fo = P("face", None, None)
     fw = P("face", None, None, None)
@@ -2311,7 +2341,8 @@ def make_tiled_fv3_hydrostatic_step_blocked_2d(
         mesh, cdgrid, coord, n: int, kt: int, nlev: int, *,
         p_floor: float, dt: float,
         sponge_sigma: float = 0.0, sponge_tau_sec: float = 0.0,
-        column_physics_fn=None, fix_mass: bool = False):
+        column_physics_fn=None, fix_mass: bool = False, surface_fn=None,
+        halo_grouping="bundled"):
     """Blocked-I/O tiled SSP-RK3 STEP on a ``(6, kt, kt)`` mesh — the
     PRODUCTION (closed-loop) variant of the step stages above.
 
@@ -2329,6 +2360,11 @@ def make_tiled_fv3_hydrostatic_step_blocked_2d(
     ``phis``, ``q_pack``) plain global shapes sharded over the same axes.
     ``fix_mass=True`` appends the serial post-step telescoping dry-mass
     fixer in-stage (one extra psum/step).  ``dt`` [s] static (closed over).
+
+    ``surface_fn`` (optional): ``surface_fn(T_t, p_s_t, q_v_t | None,
+    u_low, v_low, T_sfc_t) -> (dT, dq_v | None)`` added to every RK stage's
+    tendency; the step then takes ``T_sfc`` cc ``(6, n, n)`` (read-only,
+    not returned): ``step(..., T_sfc=...)``.
     """
     from legoesm.parallel.cubesphere_exchange import (
         make_tiled_pad_body, make_tiled_pad_vector_body)
@@ -2337,11 +2373,14 @@ def make_tiled_fv3_hydrostatic_step_blocked_2d(
     _validate_tiled_step_factory_args(
         "make_tiled_fv3_hydrostatic_step_blocked_2d", mesh, cdgrid, coord,
         n, kt, nlev, p_floor, dt)
+    if halo_grouping not in ("current", "bundled"):
+        raise ValueError(f"unknown halo_grouping {halo_grouping!r}")
     grid = cdgrid.base
     nl = n // kt
     _dt = float(dt)
     _phys = column_physics_fn
     _moist = _phys is not None
+    _sfc = surface_fn
     _fix_mass = bool(fix_mass)
     acc = conservation_accumulator()
 
@@ -2362,18 +2401,21 @@ def make_tiled_fv3_hydrostatic_step_blocked_2d(
 
     scalar_body = make_tiled_pad_body(mesh, ndim=4, halo=1, with_offsets=True)
     vector_body = make_tiled_pad_vector_body(
-        mesh, ndim=4, halo=1, with_offsets=True)
+        mesh, ndim=4, halo=1, with_offsets=True,
+        halo_grouping=halo_grouping)
     _tile_tendency, _slice_metrics = _build_hydro_tile_tendency_fns(
         coord, cdgrid, nl, nlev, p_floor, scalar_body, vector_body,
         sponge_rate=_sponge_rate_from_config(coord, sponge_sigma,
-                                             sponge_tau_sec))
+                                             sponge_tau_sec),
+        halo_grouping=halo_grouping)
 
     fo = P("face", None, None)
     cz = P("face", "tile_i", "tile_j", None)       # corner blocked / cc 4D
     co = P("face", "tile_i", "tile_j")             # cc 2D
     cz5 = P("face", "tile_i", "tile_j", None, None)  # q_pack cc 5D
 
-    state_specs = (cz, cz, cz, co, co) + ((cz5,) if _moist else ())
+    state_specs = ((cz, cz, cz, co, co) + ((cz5,) if _moist else ())
+                   + ((co,) if _sfc is not None else ()))
     out_state_specs = (cz, cz, cz, co) + ((cz5,) if _moist else ())
 
     @partial(shard_map, mesh=mesh,
@@ -2392,6 +2434,9 @@ def make_tiled_fv3_hydrostatic_step_blocked_2d(
         else:
             u_d, v_d, T, p_s, phis = args[:5]
             rest = args[5:]
+        T_sfc = None
+        if _sfc is not None:
+            T_sfc, rest = rest[0], rest[1:]
         (cosa_c, dxe, dye, ar, c00, c01, c10, c11, fco, cosau,
          dx_, dy_, ca, sa, capf, sapf, offs) = rest
 
@@ -2414,7 +2459,8 @@ def make_tiled_fv3_hydrostatic_step_blocked_2d(
         if _moist:
             def _F(s):
                 return _tile_tendency(s[0], s[1], s[2], s[3], phis, *mt,
-                                      q_pack_t=s[4], column_physics_fn=_phys)
+                                      q_pack_t=s[4], column_physics_fn=_phys,
+                                      surface_fn=_sfc, T_sfc_t=T_sfc)
 
             ud3, vd3, T3, ps3, q3 = _ssp_rk3_tile_step(
                 (u_d, v_d, T, p_s, q), _F, _dt)
@@ -2425,7 +2471,8 @@ def make_tiled_fv3_hydrostatic_step_blocked_2d(
             out_rest = (q3,)
         else:
             def _F(s):
-                return _tile_tendency(s[0], s[1], s[2], s[3], phis, *mt)
+                return _tile_tendency(s[0], s[1], s[2], s[3], phis, *mt,
+                                      surface_fn=_sfc, T_sfc_t=T_sfc)
 
             ud3, vd3, T3, ps3 = _ssp_rk3_tile_step(
                 (u_d, v_d, T, p_s), _F, _dt)
@@ -2441,7 +2488,11 @@ def make_tiled_fv3_hydrostatic_step_blocked_2d(
 
     blk = kt * (nl + 1)
 
-    def step(u_d, v_d, T, p_s, phis, q=None):
+    def step(u_d, v_d, T, p_s, phis, q=None, T_sfc=None):
+        if (_sfc is not None) != (T_sfc is not None):
+            raise ValueError(
+                "make_tiled_fv3_hydrostatic_step_blocked_2d: T_sfc must be "
+                "passed iff surface_fn was given.")
         if _moist != (q is not None):
             raise ValueError(
                 "make_tiled_fv3_hydrostatic_step_blocked_2d: q_pack must be "
@@ -2452,7 +2503,10 @@ def make_tiled_fv3_hydrostatic_step_blocked_2d(
                       v_d=(v_d, (blk, blk, nlev)), T=(T, (n, n, nlev)),
                       p_s=(p_s, (n, n)), phis=(phis, (n, n)),
                       **({"q": (q, (n, n, nlev, 3))} if _moist else {}))
-        args = (u_d, v_d, T, p_s, phis) + ((q,) if _moist else ())
+        if _sfc is not None:
+            _check_shapes(n, T_sfc=(T_sfc, (n, n)))
+        args = ((u_d, v_d, T, p_s, phis) + ((q,) if _moist else ())
+                + ((T_sfc,) if _sfc is not None else ()))
         return _step_body(*args,
                           cosa_corner, dx_edge_y, dy_edge_x, area,
                           gc00, gc01, gc10, gc11, f_corner, cosa_u,

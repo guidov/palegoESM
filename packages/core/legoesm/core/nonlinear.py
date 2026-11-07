@@ -8,6 +8,46 @@ import jax
 import jax.numpy as jnp
 
 
+def attach_implicit_gradient(
+    x_root: jax.Array,
+    residual_fn: Callable,
+    *,
+    lo: float | None = None,
+    hi: float | None = None,
+    slope_floor: float = 1.0e-6,
+) -> jax.Array:
+    """Exact implicit-function gradient for an elementwise scalar root.
+
+    ``x_root`` comes from any forward iteration (Newton, bisection, ...); it is
+    detached and replaced by one Newton correction at the root with the slope
+    held constant, ``x = x* - f(x*) / sg(f'(x*))``.  The value moves only by
+    the residual left at ``x*``; the gradient w.r.t. everything ``residual_fn``
+    closes over is ``-(df/dtheta)/(df/dx)``, and reverse mode never replays
+    the forward iteration.  ``f'`` comes from a jvp, so at a kink it is the
+    one-sided derivative of the active branch (``residual_fn`` decides which
+    branch owns an exact tie).  ``slope_floor`` keeps the division finite
+    (|f'| below it is replaced by +floor, as the Newton loops it replaces did);
+    a NaN slope stays NaN.  ``lo``/``hi`` re-apply a clip of the forward
+    iteration: a forward value at or beyond a bound is not a root; it is
+    returned unchanged with a zero gradient (``jnp.clip`` alone would pass
+    half of it at the bound).
+    """
+    x0 = jax.lax.stop_gradient(x_root)
+    f, slope = jax.jvp(residual_fn, (x0,), (jnp.ones_like(x0),))
+    slope = jax.lax.stop_gradient(jnp.where(
+        jnp.isnan(slope) | (jnp.abs(slope) > slope_floor), slope, slope_floor))
+    x = x0 - f / slope
+    if lo is not None or hi is not None:
+        x = jnp.clip(x, lo, hi)
+        pinned = jnp.zeros(x0.shape, dtype=bool)
+        if lo is not None:
+            pinned = pinned | (x0 <= lo)
+        if hi is not None:
+            pinned = pinned | (x0 >= hi)
+        x = jnp.where(pinned, x0, x)        # the forward value, no gradient
+    return x.astype(x_root.dtype)
+
+
 def make_implicit_newton_solver(
     residual_fn: Callable,
     *,
@@ -74,9 +114,18 @@ def make_implicit_newton_solver(
                 [jacobian_z, jnp.sqrt(damping) * jnp.eye(n, dtype=residual.dtype)]
             )
             rhs = jnp.concatenate([-residual, jnp.zeros(n, residual.dtype)])
-            q, r = jnp.linalg.qr(augmented)
+            # Q^T rhs from the packed reflectors, never forming Q: on GPU the
+            # explicit-Q (orgqr) step runs one small kernel chain PER MATRIX,
+            # which was ~90% of the land canopy solve's wall time.
+            packed, taus = jnp.linalg.qr(augmented, mode="raw")
+            h = packed.T
+            qt_rhs = rhs
+            for k in range(n):
+                v = jnp.concatenate([jnp.zeros(k, h.dtype),
+                                     jnp.ones(1, h.dtype), h[k + 1:, k]])
+                qt_rhs = qt_rhs - taus[k] * jnp.dot(v, qt_rhs) * v
             delta_z = jax.scipy.linalg.solve_triangular(
-                r, q.T @ rhs, lower=False
+                jnp.triu(h[:n, :]), qt_rhs[:n], lower=False
             )
             predicted = residual + jacobian_z @ delta_z
             return delta_z, jnp.sum(predicted * predicted)
@@ -136,7 +185,7 @@ def make_implicit_newton_solver(
             )
 
         initial_converged = (n_sq_0 <= atol) & accepted(x0, n_sq_0)
-        x_final, _, _, _, damping, n_iters, _ = jax.lax.while_loop(
+        x_final, _, _, n_sq_final, damping, n_iters, _ = jax.lax.while_loop(
             cond,
             body,
             (
@@ -149,8 +198,10 @@ def make_implicit_newton_solver(
                 initial_converged,
             ),
         )
-        residual_final = fun(x_final)
-        n_sq_final = jnp.sum(residual_final * residual_final)
+        # The verdict reuses the loop's own residual.  Re-evaluating it here
+        # compiles differently from the residual inside the Jacobian sweep, and
+        # at the tolerance edge that rounding flipped a column the loop had
+        # accepted onto its fallback.
         converged = ((n_sq_final <= atol + rtol * n_sq_0)
                      & accepted(x_final, n_sq_final))
         tiny = jnp.finfo(n_sq_final.dtype).tiny

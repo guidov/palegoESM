@@ -42,7 +42,7 @@ import jax
 import jax.numpy as jnp
 
 from legoesm.core.field import Field
-from legoesm.core.state import HydrostaticState
+from legoesm.core.state import HydrostaticState, with_dyn_tendencies
 from legoesm.grids.operators_latlon_cgrid import (
     gradient_x_cgrid,
     gradient_y_cgrid,
@@ -126,6 +126,25 @@ class CGridLatLonHydrostaticState(NamedTuple):
     p_s: jax.Array
     phis: jax.Array
     tracers: dict = {}
+
+
+class LatLonFaceWindState(NamedTuple):
+    """Driver-facing lat-lon state that CARRIES the native C-grid face winds.
+
+    ``u_f`` (n_lat, n_lon+1, nlev) and ``v_f`` (n_lat+1, n_lon, nlev) are the
+    dycore's own face winds; T / p_s / phis / tracers are cell-centred, all
+    ``Field``-wrapped like ``HydrostaticState``.  Feeding this back into
+    :meth:`CGridLatLonPrimitiveEquationModel.step` every step keeps the winds
+    on the faces between steps; the ``HydrostaticState`` entry instead lifts
+    cell-centre winds to the faces and averages them back on EVERY step, which
+    removes most of the eddy kinetic energy within a simulated day.
+    """
+    u_f: Field
+    v_f: Field
+    T: Field
+    p_s: Field
+    phis: Field
+    tracers: dict | None = None
 
 
 class CGridLatLonPrimitiveEquationConfig(NamedTuple):
@@ -225,6 +244,27 @@ class CGridLatLonPrimitiveEquationConfig(NamedTuple):
     # sets it from ``DycoreConfig.energy_fixer`` (default True).  Appended at
     # the tuple END: preserves positional construction.
     energy_fixer: bool = False
+    # Divergence-SELECTIVE biharmonic damping (CAM-FV ``ldiv4``), as a
+    # multiple of CAM's nondimensional rate: per latitude row
+    # nu_row = nu_div4_scale * 0.01 * area_row**2 / dt [m^4/s], applied
+    # inside the final gradient as CAM does (sw_core.F90 ~1098).  The
+    # driver fills it from ``DycoreConfig.mpas_div_damp4_scale`` (one
+    # meaning, one value on every grid).  Per row, not one global value:
+    # built from the equatorial cell a global value is RK3-unstable near
+    # the poles, built from the pole cell it is ~1000x too weak.  0.0
+    # (default) is OFF and byte-identical; needs ``dt`` in the tendency.
+    nu_div4_scale: float = 0.0
+
+
+# CAM-FV ldiv4 nondimensional rate tau4*dt (cd_core.F90:620-684); the same
+# 0.01 as the MPAS lane's ``nu_div4_cam`` in driver.component_factory.
+CAM_DIV4_RATE = 0.01
+# Highest polar-filter start latitude [deg] at which the div-4 damping's
+# stability was measured (Fourier-block eigen check, 96x48, dt 450 s:
+# worst eig*dt -0.67 at 35.9041 deg, -0.83 at 60 deg, RK3 limit ~-2.51).
+# Above it the filter covers fewer rows and nothing was measured, so the
+# model refuses it (user decision 2026-10-13).
+DIV4_MAX_POLAR_FILTER_CUTOFF_DEG = 60.0
 
 
 def _zero_v_at_pole(v, *, south: bool, north: bool, offset: int = 0):
@@ -313,6 +353,53 @@ def hydrostatic_to_cgrid(
     )
 
 
+def face_to_cell_winds(u_face, v_face):
+    """Cell-centre view of C-grid face winds (the averaging
+    :func:`cgrid_to_hydrostatic` applies)."""
+    return _face_to_cell_u(u_face), _face_to_cell_v(v_face)
+
+
+def facewind_to_cgrid(state: LatLonFaceWindState) -> CGridLatLonHydrostaticState:
+    """Unwrap a :class:`LatLonFaceWindState` to the raw-array C-grid state."""
+    tracers = ({name: f.data for name, f in state.tracers.items()}
+               if state.tracers else {})
+    return CGridLatLonHydrostaticState(
+        u=state.u_f.data, v=state.v_f.data, T=state.T.data,
+        p_s=state.p_s.data, phis=state.phis.data, tracers=tracers)
+
+
+def cgrid_to_facewind(state: CGridLatLonHydrostaticState) -> LatLonFaceWindState:
+    """Wrap a raw-array C-grid state as a :class:`LatLonFaceWindState`."""
+    dims_3d = ("lat", "lon", "level")
+    dims_2d = ("lat", "lon")
+    tracers = None
+    if state.tracers:
+        tracers = {name: Field(data=arr, name=name, dims=dims_3d, units="kg/kg")
+                   for name, arr in state.tracers.items()}
+    return LatLonFaceWindState(
+        u_f=Field(data=state.u, name="u_f", dims=("lat", "lon_face", "level"),
+                  units="m/s"),
+        v_f=Field(data=state.v, name="v_f", dims=("lat_face", "lon", "level"),
+                  units="m/s"),
+        T=Field(data=state.T, name="T", dims=dims_3d, units="K"),
+        p_s=Field(data=state.p_s, name="p_s", dims=dims_2d, units="Pa"),
+        phis=Field(data=state.phis, name="phis", dims=dims_2d,
+                   units="m^2/s^2"),
+        tracers=tracers)
+
+
+def hydrostatic_to_facewind(state: HydrostaticState,
+                            grid: LatLonGrid) -> LatLonFaceWindState:
+    """Lift cell-centre winds to the faces ONCE (run start / old restart)."""
+    return cgrid_to_facewind(hydrostatic_to_cgrid(state, grid))
+
+
+def facewind_to_hydrostatic(state: LatLonFaceWindState,
+                            grid: LatLonGrid) -> HydrostaticState:
+    """Cell-centre VIEW of a face-wind state (face winds averaged)."""
+    return cgrid_to_hydrostatic(facewind_to_cgrid(state), grid)
+
+
 def cgrid_to_hydrostatic(
     state: CGridLatLonHydrostaticState,
     grid: LatLonGrid,
@@ -379,7 +466,8 @@ def cgrid_latlon_hydrostatic_tendencies(
         byte-identical.
     dt : float, optional
         Step length [s]; required only when ``config.nu_del4 > 0`` (sizes the
-        per-row pole stability cap of the hyperdiffusion).
+        per-row pole stability cap of the hyperdiffusion) or
+        ``config.nu_div4_scale > 0`` (the div-4 rate 0.01*area^2/dt).
 
     Returns
     -------
@@ -862,6 +950,26 @@ def cgrid_latlon_hydrostatic_tendencies(
         flux_T = dp_T * nu_u[..., None] * laplacian_cgrid(T, grid)
         dT_dt = dT_dt - laplacian_cgrid(flux_T, grid) / dp_T
 
+    # --- 13a'. Divergence-selective del-4 damping (CAM-FV ldiv4) ---
+    # SIGN: (du, dv) -= grad(nu * lap(D)), D = div(u, v).  The divergence of
+    # that increment is -lap(nu lap D); for constant nu a Fourier mode of D
+    # (lap -> -k^2) decays at nu k^4.  Non-divergent flow (D = 0) gets
+    # exactly zero.  nu is per latitude ROW (cell area squared), inside the
+    # final gradient as in CAM.  It runs at every RK stage, so the polar
+    # filter of du/dv covers it (without the filter the pole rows are
+    # unstable).  Off (0.0) adds nothing: byte-identical.
+    if config.nu_div4_scale > 0.0:
+        if dt is None:
+            raise ValueError(
+                "cgrid_latlon_hydrostatic_tendencies: nu_div4_scale > 0 "
+                "requires the dt argument (the coefficient is 0.01*area^2/dt).")
+        D = divergence_cgrid(u, v, grid, lat_pad=_lat_pad)
+        nu_row = (config.nu_div4_scale * CAM_DIV4_RATE
+                  * grid.area[:, 0] ** 2 / dt).astype(D.dtype)   # (n_lat,)
+        psi = nu_row[:, None, None] * laplacian_cgrid(D, grid)
+        du_dt = du_dt - gradient_x_cgrid(psi, grid)
+        dv_dt = dv_dt - gradient_y_cgrid(psi, grid)
+
     # --- 13b. Top sponge (Rayleigh damping increasing toward the lid, #836) ---
     # Absorb upward-propagating gravity-wave / convective energy that would else
     # reflect off the rigid model lid and contaminate the upper levels.  Gated on
@@ -951,6 +1059,26 @@ class CGridLatLonPrimitiveEquationModel(IntegrationMixin):
         self.grid = grid
         self.sigma_coord = sigma_coord
         self.config = config or CGridLatLonPrimitiveEquationConfig()
+        if self.config.nu_div4_scale > 0.0 and not self.config.use_polar_filter:
+            # Measured (Fourier-block eigen check of the damping on the 96x48
+            # grid): worst eigenvalue x dt -149.6 with no filter, against the
+            # SSP-RK3 real-axis limit ~-2.51; -0.67 / -0.83 with the filter
+            # starting at 35.9 / 60 deg.  A smaller dt does not help: the
+            # coefficient scales as 1/dt, so the per-step damping is fixed.
+            raise ValueError(
+                "nu_div4_scale > 0 needs use_polar_filter=True: the per-row "
+                "div-4 coefficient 0.01*area^2/dt is unstable on the pole rows "
+                "without the polar filter (measured at scale 1; a smaller dt "
+                "does not help).")
+        if (self.config.nu_div4_scale > 0.0
+                and self.config.polar_filter_cutoff_deg
+                > DIV4_MAX_POLAR_FILTER_CUTOFF_DEG):
+            raise ValueError(
+                "nu_div4_scale > 0 needs polar_filter_cutoff_deg <= "
+                f"{DIV4_MAX_POLAR_FILTER_CUTOFF_DEG} (got "
+                f"{self.config.polar_filter_cutoff_deg}): the div-4 damping's "
+                "stability under the polar filter was measured only for a "
+                "filter starting at 35.9041 and 60 deg.")
 
         # Stash the constructor ``dt`` so callers downstream (notably
         # ``make_latlon_mpi_step`` rebuilding an MPI-aware model) can
@@ -1277,8 +1405,12 @@ class CGridLatLonPrimitiveEquationModel(IntegrationMixin):
         # state, applied as an Euler increment (see the docstring). ---
         phys_state_out = phys_state
         if physics_fn is not None:
+            _hs_new = cgrid_to_hydrostatic(state_new, grid)
+            if phys_state is not None:
+                phys_state = with_dyn_tendencies(
+                    phys_state, cgrid_to_hydrostatic(state_c, grid), _hs_new, dt)
             _pr = self._call_physics_raw(
-                physics_fn, cgrid_to_hydrostatic(state_new, grid),
+                physics_fn, _hs_new,
                 phys_state, grid=grid, sigma_coord=sigma_coord)
             if type(_pr) is tuple:
                 phys_tend = _pr[0]
@@ -1313,6 +1445,48 @@ class CGridLatLonPrimitiveEquationModel(IntegrationMixin):
     # Public API — matches the driver contract
     # ------------------------------------------------------------------
 
+    def lift_wind_increment(self, du_cell, dv_cell, *, grid=None,
+                            polar_mask=None, polar_mask_v=None,
+                            own_polar_masks: bool = False):
+        """Cell-centre wind increments -> u/v face increments.
+
+        The interpolators the RK coupling uses, then the polar Fourier filter
+        the dycore applies to its own physics increments when the filter is
+        on.  ``grid`` defaults to the model's; ``own_polar_masks`` takes the
+        model's own filter masks (``None`` masks = no filter).  Linear in the increments.  The caller re-walls ``v``
+        at the poles (this returns the lifted increment unwalled).
+        """
+        grid = self.grid if grid is None else grid
+        if own_polar_masks:
+            if polar_mask is not None or polar_mask_v is not None:
+                raise ValueError("pass explicit polar masks OR "
+                                 "own_polar_masks=True, not both")
+            polar_mask, polar_mask_v = self._polar_mask, self._polar_mask_v
+        du = interp_cell_to_uface(du_cell)
+        dv = interp_cell_to_vface_halo(dv_cell)
+        if polar_mask is not None:
+            du_int = fourier_filter_3d(du[:, :-1, :], grid, polar_mask)
+            du_closure = pad_lon_cgrid(du_int, halo=1)[:, -1:, :]
+            du = jnp.concatenate([du_int, du_closure], axis=1)
+            dv = fourier_filter_3d(dv, grid, polar_mask_v)
+        return du, dv
+
+    def wall_v(self, v, pole_v_bc_masks=None):
+        """Re-impose the pole wall on face ``v`` (the same rule
+        :meth:`_apply_physics_increment` applies after its increment)."""
+        if pole_v_bc_masks is not None:
+            _south_m, _north_m = pole_v_bc_masks
+            _off = self.config.pole_v_bc_offset
+            _n = v.shape[0]
+            v = jnp.where(
+                _south_m, v.at[_off].set(jnp.zeros_like(v[_off])), v)
+            return jnp.where(
+                _north_m,
+                v.at[_n - 1 - _off].set(jnp.zeros_like(v[_n - 1 - _off])), v)
+        return _zero_v_at_pole(
+            v, south=self.config.pole_v_bc[0], north=self.config.pole_v_bc[1],
+            offset=self.config.pole_v_bc_offset)
+
     def _apply_physics_increment(
         self, state, phys_tend, dt, *, grid, sigma_coord,
         polar_mask=None, polar_mask_v=None, pole_v_bc_masks=None,
@@ -1339,18 +1513,15 @@ class CGridLatLonPrimitiveEquationModel(IntegrationMixin):
         # PhysicsTendencies.dv_dt is Optional (state.py); du_dt is not
         dv_phys = dt * (phys_tend.dv_dt.data if phys_tend.dv_dt is not None
                         else jnp.zeros_like(du_phys))
-        du = interp_cell_to_uface(du_phys)
-        dv = interp_cell_to_vface_halo(dv_phys)
+        du, dv = self.lift_wind_increment(
+            du_phys, dv_phys, grid=grid, polar_mask=polar_mask,
+            polar_mask_v=polar_mask_v)
         tt = phys_tend.tracer_tendencies
         dq_dt = ({k: f.data for k, f in tt.items() if k in state.tracers}
                  if (tt is not None and state.tracers) else {})
         if polar_mask is not None:
             dT = fourier_filter_3d(dT, grid, polar_mask)
             dps = fourier_filter(dps, grid, polar_mask)
-            du_int = fourier_filter_3d(du[:, :-1, :], grid, polar_mask)
-            du_closure = pad_lon_cgrid(du_int, halo=1)[:, -1:, :]
-            du = jnp.concatenate([du_int, du_closure], axis=1)
-            dv = fourier_filter_3d(dv, grid, polar_mask_v)
             # tracer increments are NOT filtered: a physics increment has
             # no advective CFL (the filter protects transport at the
             # lifted equatorial dt), and filtering the water increment
@@ -1370,21 +1541,7 @@ class CGridLatLonPrimitiveEquationModel(IntegrationMixin):
             tracers_new, p_s_new = apply_physics_water_mass(
                 state.tracers, dq_dt, state.p_s, sigma_coord, dt)
         p_s_new = p_s_new + dps
-        if pole_v_bc_masks is not None:
-            _south_m, _north_m = pole_v_bc_masks
-            _off = self.config.pole_v_bc_offset
-            _n = v_new.shape[0]
-            v_new = jnp.where(
-                _south_m, v_new.at[_off].set(jnp.zeros_like(v_new[_off])), v_new)
-            v_new = jnp.where(
-                _north_m,
-                v_new.at[_n - 1 - _off].set(jnp.zeros_like(v_new[_n - 1 - _off])),
-                v_new)
-        else:
-            v_new = _zero_v_at_pole(
-                v_new, south=self.config.pole_v_bc[0],
-                north=self.config.pole_v_bc[1],
-                offset=self.config.pole_v_bc_offset)
+        v_new = self.wall_v(v_new, pole_v_bc_masks)
         return state._replace(u=u_new, v=v_new, T=T_new, p_s=p_s_new,
                               tracers=tracers_new)
 
@@ -1423,6 +1580,7 @@ class CGridLatLonPrimitiveEquationModel(IntegrationMixin):
         # Conservation fixer for mass — fp64 budget accumulator
         # (iter-12 mirrors compute_mass; see docstring there).
         if self.config.fix_mass:
+            _pre_mf = state
             acc = conservation_accumulator()
             # ``grid_total_area`` is a precomputed scalar on the grid;
             # avoids recomputing ``jnp.sum(area)`` every step (one
@@ -1494,6 +1652,18 @@ class CGridLatLonPrimitiveEquationModel(IntegrationMixin):
                 state = state._replace(tracers=new_tracers)
 
             state = state._replace(p_s=p_s_post)
+            if self.config.energy_fixer:
+                # The mass fixer sits outside the energy window (after
+                # physics): return the energy its p_s shift changed as a
+                # uniform heating [K, +warming] (F15 V8, vote B).  Same
+                # cell-centre energy and global reduction as the fixer.
+                def _cc(s):
+                    return (s.T, _face_to_cell_u(s.u), _face_to_cell_v(s.v),
+                            s.p_s, s.phis)
+                _dT_mf = gridded_energy_fixer_dT(
+                    _cc(_pre_mf), _cc(state), grid, sigma_coord)
+                state = state._replace(
+                    T=state.T + _dT_mf.astype(state.T.dtype))
 
         # #1354/#1515: shared tracer positivity stage — this lane previously had
         # NO tracer floor, so negatives from non-monotone transport persisted.
@@ -1601,6 +1771,15 @@ class CGridLatLonPrimitiveEquationModel(IntegrationMixin):
             state_new, self._phys_state = self._step_cgrid(
                 state, dt, target_mass, physics_fn, phys_state)
             return state_new
+
+        if isinstance(state, LatLonFaceWindState):
+            # Native face winds in, native face winds out: no cell<->face
+            # projection.  The energy fixer's window is the cell-centre view
+            # of these faces (the same window a raw C-grid input gets).
+            cgrid_out, self._phys_state = self._step_cgrid(
+                facewind_to_cgrid(state), dt, target_mass, physics_fn,
+                phys_state)
+            return cgrid_to_facewind(cgrid_out)
 
         # HydrostaticState input: use cached face-staggered winds from
         # the previous step to avoid lossy cell→face re-projection.

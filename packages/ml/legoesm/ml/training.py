@@ -407,6 +407,15 @@ def make_train_step(optimizer: optax.GradientTransformation, grid: GaussianGrid)
     return train_step
 
 
+def checkpoint_view(model):
+    """``model`` with each module's on-disk view (AIMIP frozen knobs: see
+    AIMIPClassicalParams.for_checkpoint), so a checkpoint loads into an
+    all-array template as well as into a frozen one."""
+    return jax.tree_util.tree_map(
+        lambda x: x.for_checkpoint() if hasattr(x, "for_checkpoint") else x,
+        model, is_leaf=lambda x: hasattr(x, "for_checkpoint"))
+
+
 def save_checkpoint(
     model,
     path: str | Path,
@@ -430,17 +439,23 @@ def save_checkpoint(
     path : str or Path
         Destination file path for the checkpoint.
     """
+    from legoesm.ml.checkpoint_io import knob_record_path, write_knob_record
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    # A module may supply its on-disk view (AIMIP frozen knobs: see
-    # AIMIPClassicalParams.for_checkpoint).
-    model = jax.tree_util.tree_map(
-        lambda x: x.for_checkpoint() if hasattr(x, "for_checkpoint") else x,
-        model, is_leaf=lambda x: hasattr(x, "for_checkpoint"))
+    # No stale record may pair with the new file: drop it once the new payload
+    # is serialised, just before it replaces the old one, and write it after
+    # (a serialisation failure keeps the old payload AND its record; a crash
+    # between unlink and replace leaves no record, so an AIMIP checkpoint
+    # then refuses to load; codex + GLM 2026-10-29).
+    live = model
+    model = checkpoint_view(model)
     try:
         eqx.tree_serialise_leaves(str(tmp), model)
+        knob_record_path(path).unlink(missing_ok=True)
         os.replace(tmp, path)
+        write_knob_record(live, path)
     finally:
         # ``os.replace`` consumes ``tmp`` on success; this only fires if
         # serialisation raised, cleaning up the partial temp file.

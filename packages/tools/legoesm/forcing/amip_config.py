@@ -105,7 +105,6 @@ class AMIPExperimentConfig(NamedTuple):
     bechtold_downdraft_detrain_scale_m: float = 700.0
     bechtold_downdraft_transport: bool = False
     bechtold_subsidence_solve: str = "implicit_flux"
-    convective_buoyancy_death_memory: bool = False
     convective_cloud: bool = False
     # Bechtold convective-downdraft strength (marine humid-BL evaporation lever).
     bechtold_downdraft_evap: float = 0.05
@@ -115,6 +114,9 @@ class AMIPExperimentConfig(NamedTuple):
     # the flat schema so the to_amip_config/from_amip_config round-trip cannot
     # silently drop an explicit selection across a checkpoint/restart boundary.
     bechtold_use_ifs_cape_closure: bool = True
+    # Faithful CUMASTRN path (BechtoldConfig.use_ifs_ascent); flat schema so
+    # the AMIP round-trip carries it across a restart.
+    bechtold_use_ifs_ascent: bool = False
     # IFS Kessler sub-cloud rain evaporation (cuflxn.F90; default ON
     # 2026-07-16) — in the flat schema so round-trips cannot drop it.
     bechtold_use_ifs_subcloud_evap: bool = True
@@ -130,6 +132,7 @@ class AMIPExperimentConfig(NamedTuple):
     bechtold_use_ifs_capdcycl: bool = True
     bechtold_use_ifs_land_rhebc: bool = True
     bechtold_use_ifs_snow_melt: bool = True
+    bechtold_ifs_shallow_nosupply: str = "zero"
     # Convective in-updraft rain-split efficiency [0,1] (shared across the
     # mass-flux schemes); 0 = disabled (legacy no split).
     convective_precip_efficiency: float = 0.0
@@ -172,8 +175,8 @@ class AMIPExperimentConfig(NamedTuple):
     turbulence: str = "none"
     gravity_wave_drag: str = "none"
     fix_moisture: bool = False
-    # Issue #323: moist-static-energy-conserving q_v floor (remove the
-    # latent heat of the clipped vapour sink).  Opt-in for kessler+sbm.
+    # Issue #323: the q_v floor also books each cell's latent heat (per-cell
+    # moist-static-energy-conserving borrow).  Opt-in for kessler+sbm.
     energy_consistent_moisture_clip: bool = False
 
     # Topography
@@ -229,6 +232,8 @@ class AMIPExperimentConfig(NamedTuple):
     morrison_sed_cfl_substeps_strict: bool = False  # error when a column exceeds the cap
     morrison_do_graupel: bool = True  # Morrison graupel category (CAM6 MG2 has none)
     zm_land_fraction: str = "required"  # ZM land mask policy: "required" | "none" (aquaplanet)
+    zm_transport_cloud_tracers: bool = True  # ZM convtran of carried cloud/precip tracers (CAM6)
+    kain_fritsch_variant: str = "smooth"  # KF: "smooth" (default) | "wrf_kfeta" (opt-in WRF port, #2280)
 
 
 def config_to_dict(config) -> dict:
@@ -416,16 +421,24 @@ def load_checkpoint(
     # downcast carry), and a storage cast here would also make the
     # restart non-bit-exact for the physics memory.  Everything else
     # (held radiation, conv_prog, T_land, …) keeps the legacy storage
-    # cast.
-    _keep_stored_dtype = ("tke", "qke", "gwd_spectrum")
+    # cast.  The mass/moisture fixer targets are global totals (~5e19 kg)
+    # saved in float64; a float32 cast moves the target by ~1e12 kg, so the
+    # fixer pulls a restarted run off the straight run.
+    _keep_stored_dtype = ("tke", "qke", "gwd_spectrum",
+                          "target_dry_mass", "target_moisture")
     carry_aux = {}
     for key in data.files:
         if key.startswith("carry_"):
             _name = key[6:]
-            if _name == "conv_prog_scheme":
+            if _name == "conv_prog_scheme" or _name.endswith("_sha256"):
                 # Scheme tag for the convection carry (issue #413) —
                 # a plain string, not a float array.
                 carry_aux[_name] = str(data[key])
+            elif f"{key}_sha256" in data.files:
+                # digest-protected: kept as the stored numpy bytes (a jnp
+                # array would drop float64 to float32 with x64 off), verified,
+                # then cast by the consumer
+                carry_aux[_name] = np.asarray(data[key])
             elif _name in _keep_stored_dtype:
                 carry_aux[_name] = jnp.array(data[key])
             else:
