@@ -35,7 +35,15 @@ Paleoclimate simulations (such as modeling the Last Glacial Maximum (LGM) or Dee
 - **Swappable Physics Bricks**: If a specific legacy vegetation or ice sheet scheme fails under deep-time conditions (a common issue in traditional models), legoESM allows you to cleanly snap in alternative parameterizations or AI-driven emulators without rebuilding the whole system.
 - **Massive Hardware Acceleration**: Running centennial or millennial paleoclimate scales is computationally punishing. legoESM is built from day one to scale seamlessly on GPUs and TPUs, significantly accelerating long-duration runs.
 
-See [`scripts/paleo/README.md`](file:///home/guido/palegoESM/scripts/paleo/README.md) for the paleoclimate boundary-condition toolkit and presets.
+### Paleoclimate Repositories & Datasets
+
+- **Code Repository (`palegoESM`)**: [`https://github.com/guidov/palegoESM`](https://github.com/guidov/palegoESM) (upstream `legoESM` tracked via `origin`, paleoclimate boundary-condition toolkit in [`scripts/paleo/`](file:///home/guido/palegoESM/scripts/paleo/README.md)).
+- **Public Dataset Repository (Hugging Face)**: [`https://huggingface.co/datasets/guidov/palegoESM-data`](https://huggingface.co/datasets/guidov/palegoESM-data) — hosts compressed NetCDF-4 `palegoESM`-ready 0.25° topography/bathymetry/ice-mask datasets (`ICE-6G_C`, `ICE-6G_A`, `ICE-7G_NA`, `ICE-5G`, `ETOPO` 0 ka), LGM CLM `surfdata`, and the 10-arc-minute source reconstructions. Also mirrored on [GitHub Release `v0.1.0-data`](https://github.com/guidov/palegoESM/releases/tag/v0.1.0-data).
+- **Fetch Datasets**:
+  ```bash
+  python scripts/paleo/download_paleo_data.py --dest-dir data/paleo
+  ```
+- **See [`scripts/paleo/README.md`](file:///home/guido/palegoESM/scripts/paleo/README.md)** for full instructions on building, customizing, and uploading paleoclimate boundary conditions.
 
 ## Getting started (about one hour)
 

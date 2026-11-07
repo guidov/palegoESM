@@ -34,12 +34,26 @@ Paleoclimate simulations (such as modeling the Last Glacial Maximum (LGM) or Dee
 
 ## 2. Quick Start
 
-### Step 1: Generate `palegoESM`-ready LGM / PI Topography & Bathymetry
-Build 0.25° (or any resolution) NetCDF files in `/home/guido/paleo_data/palegoESM/` from the 10-minute `ICE-6G_C`, `ICE-6G_A`, `ICE-7G_NA`, `ICE-5G`, or `ETOPO` datasets:
+### Step 0: Download Pre-Built Boundary Conditions from Hugging Face
+All compressed NetCDF-4 `palegoESM` boundary condition datasets and 10-minute source reconstructions are hosted publicly on Hugging Face at **[`https://huggingface.co/datasets/guidov/palegoESM-data`](https://huggingface.co/datasets/guidov/palegoESM-data)** (with automatic fallback to [GitHub Release `v0.1.0-data`](https://github.com/guidov/palegoESM/releases/tag/v0.1.0-data)):
 
 ```bash
-# LGM (21 ka) with ICE-6G_C (Kevin 2016 update) + ETOPO
+# Download ready-to-run 0.25-deg palegoESM topography & LGM CLM surfdata (~74 MB total)
+python scripts/paleo/download_paleo_data.py --dest-dir data/paleo
+
+# Also download the 10-arc-minute ICE-5G / ICE-6G_A / ICE-6G_C / ICE-7G_NA / ETOPO source files
+python scripts/paleo/download_paleo_data.py --dest-dir data/paleo --include-source-reconstructions
+```
+
+### Step 1: Generate `palegoESM`-ready LGM / PI Topography & Bathymetry
+Build compressed NetCDF-4 (`zlib=True, complevel=4`) 0.25° (or any resolution) files in `/home/guido/paleo_data/palegoESM/` from the 10-minute `ICE-6G_C`, `ICE-6G_A`, `ICE-7G_NA`, `ICE-5G`, or `ETOPO` datasets:
+
+```bash
+# LGM (21 ka) presets (ICE-6G_C, ICE-6G_A, ICE-7G_NA, ICE-5G)
 python scripts/paleo/build_paleo_topography.py --preset lgm_ice6gc --resolution-deg 0.25
+python scripts/paleo/build_paleo_topography.py --preset lgm_ice6ga --resolution-deg 0.25
+python scripts/paleo/build_paleo_topography.py --preset lgm_ice7gna --resolution-deg 0.25
+python scripts/paleo/build_paleo_topography.py --preset lgm_ice5g --resolution-deg 0.25
 
 # LGM (21 ka) with 0.66x scaled ice-sheet elevation (as in reduce_LGM_topo_by_point66.ncl)
 python scripts/paleo/build_paleo_topography.py --preset lgm_ice6ga --ice-topo-scale 0.66 \
@@ -57,7 +71,13 @@ python scripts/paleo/build_paleo_clm_surfdata.py \
     --out /home/guido/paleo_data/palegoESM/surfdata_fv1_lgm_ice6gc.nc
 ```
 
-### Step 3: Use in Python / Model Config
+### Step 3: Publish Updated Datasets to Hugging Face
+If you generate new boundary conditions in `/home/guido/paleo_data/palegoESM/`, upload them to [`guidov/palegoESM-data`](https://huggingface.co/datasets/guidov/palegoESM-data):
+```bash
+python scripts/paleo/upload_paleo_data_hf.py
+```
+
+### Step 4: Use in Python / Model Config
 ```python
 from scripts.paleo.paleo_presets import get_preset
 from legoesm.atmosphere.physics.radiation.solar import OrbitalParameters
@@ -68,4 +88,20 @@ orbit = OrbitalParameters(
     obliquity_deg=preset.obliquity_deg,
     long_perihelion_deg=preset.long_perihelion_deg,
 )
+```
+
+---
+
+## 3. Repository & Upstream Sync Workflow
+
+`/home/guido/palegoESM` is a Git worktree on branch `paleo` tracking two remotes:
+- `palego`: `git@github.com:guidov/palegoESM.git` (pushes `paleo` to `main`)
+- `origin`: `https://github.com/climate-federation/legoESM.git` (upstream `legoESM`)
+
+To pull the latest upstream `legoESM` changes into `palegoESM` and push to GitHub:
+```bash
+cd /home/guido/palegoESM
+git fetch origin main
+git merge origin/main
+git push palego paleo:main
 ```
