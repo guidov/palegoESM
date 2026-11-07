@@ -40,10 +40,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paleo_presets import PALEO_DATA_ROOT, PALEO_PRESETS, get_preset
 
 
+def _find_coord(ds: xr.Dataset, candidates: tuple[str, ...]) -> str:
+    for c in candidates:
+        if c in ds.coords or c in ds.variables or c in ds.dims:
+            return c
+    raise KeyError(f"None of {candidates} found in dataset; have {list(ds.variables)}")
+
+
 def _normalize_lat_lon(ds: xr.Dataset, lat_name: str, lon_name: str) -> xr.Dataset:
     """Ensure South-to-North latitude [-90, 90] and ascending longitude [0, 360)."""
-    if lat_name != "lat" or lon_name != "lon":
-        ds = ds.rename({lat_name: "lat", lon_name: "lon"})
+    rename_map = {}
+    if lat_name != "lat":
+        rename_map[lat_name] = "lat"
+    if lon_name != "lon":
+        rename_map[lon_name] = "lon"
+    if rename_map:
+        ds = ds.rename(rename_map)
     ds = ds.assign_coords(lon=(ds["lon"] % 360.0))
     _, uniq_lon = np.unique(np.round(ds["lon"].values, 6), return_index=True)
     ds = ds.isel(lon=np.sort(uniq_lon)).sortby("lon")
@@ -64,8 +76,8 @@ def build_paleo_topography_dataset(
 ) -> xr.Dataset:
     """Construct a regular lat-lon topography + bathymetry + ice-mask Dataset."""
     ds_topo = xr.open_dataset(topo_path)
-    lat_var = "lat" if "lat" in ds_topo.coords or "lat" in ds_topo.variables else "Lat"
-    lon_var = "lon" if "lon" in ds_topo.coords or "lon" in ds_topo.variables else "Lon"
+    lat_var = _find_coord(ds_topo, ("lat", "Lat", "latitude"))
+    lon_var = _find_coord(ds_topo, ("lon", "Lon", "long", "longitude"))
     ds_topo = _normalize_lat_lon(ds_topo, lat_var, lon_var)
 
     for cand in ("topo", "elevation", "orog", "Topo", "Orog"):
@@ -116,16 +128,28 @@ def build_paleo_topography_dataset(
     ice_thickness = np.zeros_like(land_mask, dtype=np.float32)
     if icesheet_path is not None and icesheet_path.exists():
         ds_ice = xr.open_dataset(icesheet_path)
-        la_i = "lat" if "lat" in ds_ice.variables else "Lat"
-        lo_i = "lon" if "lon" in ds_ice.variables else "Lon"
+        la_i = _find_coord(ds_ice, ("lat", "Lat", "latitude"))
+        lo_i = _find_coord(ds_ice, ("lon", "Lon", "long", "longitude"))
         ds_ice = _normalize_lat_lon(ds_ice, la_i, lo_i)
         if "Icemask" in ds_ice.data_vars:
             im = ds_ice["Icemask"].astype(np.float64).interp(
                 lat=target_lat, lon=target_lon, method="nearest"
             )
             ice_mask = (np.nan_to_num(im.values, nan=0.0) > 0.5).astype(np.float32)
+        elif "sftgif" in ds_ice.data_vars:
+            im = ds_ice["sftgif"].astype(np.float64).interp(
+                lat=target_lat, lon=target_lon, method="nearest"
+            )
+            vals = np.nan_to_num(im.values, nan=0.0)
+            thresh = 50.0 if vals.max() > 1.5 else 0.5
+            ice_mask = (vals > thresh).astype(np.float32)
         if "IceT" in ds_ice.data_vars:
             it = ds_ice["IceT"].astype(np.float64).interp(
+                lat=target_lat, lon=target_lon, method="linear"
+            )
+            ice_thickness = np.maximum(np.nan_to_num(it.values, nan=0.0), 0.0).astype(np.float32)
+        elif "sftgit" in ds_ice.data_vars:
+            it = ds_ice["sftgit"].astype(np.float64).interp(
                 lat=target_lat, lon=target_lon, method="linear"
             )
             ice_thickness = np.maximum(np.nan_to_num(it.values, nan=0.0), 0.0).astype(np.float32)
