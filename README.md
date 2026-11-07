@@ -26,6 +26,17 @@ It takes you from `git clone` to your own 3-D atmosphere experiment, with the
 results plotted, in well under an hour. The feature inventory and reference
 material come after it.
 
+## Why legoESM Changes Paleoclimate Modeling (`palegoESM`)
+
+Paleoclimate simulations (such as modeling the Last Glacial Maximum (LGM) or Deep Time eras) historically suffer from massive uncertainties in boundary conditions, sparse proxy data, and manual parameter tuning. legoESM addresses these problems directly:
+
+- **Gradient-Based Calibration**: Instead of manually "tuning" parameters (like cloud microphysics or soil properties) over years of trial-and-error, you can take the exact mathematical gradient (`jax.grad`) through the entire coupled model. This allows automated, gradient-based optimization to align the model directly with paleoclimate proxy data.
+- **Seamless Data Assimilation**: Paleoclimate data assimilation (combining tree rings, ice cores, or sediment data with physical models) becomes exceptionally clean. Variational data assimilation is native to legoESM because the code calculates its own gradients.
+- **Swappable Physics Bricks**: If a specific legacy vegetation or ice sheet scheme fails under deep-time conditions (a common issue in traditional models), legoESM allows you to cleanly snap in alternative parameterizations or AI-driven emulators without rebuilding the whole system.
+- **Massive Hardware Acceleration**: Running centennial or millennial paleoclimate scales is computationally punishing. legoESM is built from day one to scale seamlessly on GPUs and TPUs, significantly accelerating long-duration runs.
+
+See [`scripts/paleo/README.md`](file:///home/guido/palegoESM/scripts/paleo/README.md) for the paleoclimate boundary-condition toolkit and presets.
+
 ## Getting started (about one hour)
 
 Every legoESM command in this section was run on a fresh clone of
